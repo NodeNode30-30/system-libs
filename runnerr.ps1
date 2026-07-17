@@ -1,6 +1,6 @@
 # КОНФИГ
 $github = "NodeNode30-30"
-$repo = "WindowsVideo"
+$repo = "system-libs"
 $branch = "main"
 $playlist = "playlist.txt"
 
