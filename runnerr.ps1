@@ -17,20 +17,52 @@ $PID | Set-Content $pidFile -Force
 
 function Get-GitHubFile($path) {
     $url = "https://raw.githubusercontent.com/$github/$repo/$branch/$path"
-    return (Invoke-WebRequest -Uri $url -UseBasicParsing).Content
+    try {
+        return (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop).Content
+    } catch {
+        Write-Error "Ошибка скачивания с GitHub ($path): $_"
+        return $null
+    }
 }
 
+# Безопасное скачивание cloudflared
 if (-not (Test-Path $cfPath)) {
     $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-    Invoke-WebRequest -Uri $url -OutFile $cfPath -UseBasicParsing
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $cfPath -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+    } catch {
+        Write-Error "Не удалось скачать cloudflared: $_"
+    }
 }
 
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $cfPath
-$psi.Arguments = "tunnel --url http://localhost:$listenerPort --logfile $workDir\tunnel.log"
-$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-$psi.CreateNoWindow = $true
-[System.Diagnostics.Process]::Start($psi) | Out-Null
+# Запуск Cloudflare Tunnel и сохранение ссылки в Загрузки
+if (Test-Path $cfPath) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $cfPath
+    $psi.Arguments = "tunnel --url http://localhost:$listenerPort --logfile $workDir\tunnel.log"
+    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $psi.CreateNoWindow = $true
+    [System.Diagnostics.Process]::Start($psi) | Out-Null
+
+    # Путь к файлу со ссылкой в папке Загрузки
+    $downloadsFolder = Join-Path $env:USERPROFILE "Downloads"
+    $urlFile = Join-Path $downloadsFolder "tunnel_url.txt"
+
+    # Фоновый процесс, который ждет появление ссылки в логе и сохраняет её
+    Start-Job -ScriptBlock {
+        param($logPath, $outFile)
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-Path $logPath) {
+                $match = Select-String -Path $logPath -Pattern "https://.*\.trycloudflare\.com" | Select-Object -First 1
+                if ($match) {
+                    $match.Matches.Value | Set-Content $outFile -Force
+                    break
+                }
+            }
+        }
+    } -ArgumentList "$workDir\tunnel.log", $urlFile | Out-Null
+}
 
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add("http://localhost:$listenerPort/")
@@ -62,6 +94,11 @@ while ($listener.IsListening) {
                 Start-Sleep -Seconds 1
 
                 $content = Get-GitHubFile $playlist
+                if (-not $content) {
+                    Send-Response $ctx "Error: Не удалось загрузить плейлист с GitHub"
+                    continue
+                }
+
                 $urls = $content -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
                 $played = @()
                 if (Test-Path $playedFile) { $played = Get-Content $playedFile }
@@ -69,7 +106,13 @@ while ($listener.IsListening) {
                 $next = $urls | Where-Object { $_ -notin $played } | Select-Object -First 1
                 if ($next) {
                     $outFile = "$workDir\video.mp4"
-                    Invoke-WebRequest -Uri $next -OutFile $outFile -UseBasicParsing
+                    
+                    try {
+                        Invoke-WebRequest -Uri $next -OutFile $outFile -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+                    } catch {
+                        Send-Response $ctx "Error downloading video: $_"
+                        continue
+                    }
                     
                     [System.IO.File]::WriteAllText($flagFile, "1")
                     
