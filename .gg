@@ -1,0 +1,1 @@
+Get-Content "$env:LOCALAPPDATA\Microsoft\MSUpdate\tunnel.log" -ErrorAction SilentlyContinue | Select-String "https://[a-zA-Z0-9-]+\.trycloudflare\.com"
